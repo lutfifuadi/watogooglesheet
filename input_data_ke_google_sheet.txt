@@ -1,0 +1,399 @@
+/**
+ * ==============================================
+ * KODE UTAMA - WEBHOOK HANDLER
+ * ==============================================
+ */
+
+/**
+ * Fungsi utama untuk menangani request POST dari webhook
+ * @param {Object} e - Event object dari Google Apps Script
+ */
+function doPost(e) {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = spreadsheet.getSheetByName("Log") || spreadsheet.insertSheet("Log");
+  
+  // Log request masuk secara detail
+  logSheet.appendRow([new Date(), "Request masuk (raw): " + JSON.stringify(e)]);
+  
+  try {
+    // 1. Ambil konfigurasi
+    var configSheet = spreadsheet.getSheetByName("Konfigurasi") || createConfigSheet();
+    var config = getConfigValues(configSheet);
+    validateConfig(config);
+
+    // 2. Parse data input
+    var requestData = JSON.parse(e.postData.contents);
+    var message = requestData.message || "";
+    var senderNumber = requestData.from || "";
+    logSheet.appendRow([new Date(), "Data parsed: " + JSON.stringify({message: message, senderNumber: senderNumber})]);
+
+    // 3. Handle konfirmasi user
+    if (message.toLowerCase() === "ya" || message.toLowerCase() === "tidak") {
+      return handleUserConfirmation(requestData, config);
+    }
+
+    // 4. Cek trigger keyword
+    if (!isTriggerMatch(message, config.trigger_keyword)) {
+      logSheet.appendRow([new Date(), "Pesan diabaikan: Trigger tidak ditemukan"]);
+      return createResponse("ignored", "Keyword trigger tidak ditemukan");
+    }
+
+    // 5. Parsing data pendaftaran (dengan error handling)
+    var parsedData = parseRegistrationData(message);
+    var name = parsedData.name || "";
+    var email = parsedData.email || "";
+    var number = parsedData.number || "";
+    var participant = parsedData.participant || "";
+    
+    // Log hasil parsing
+    logSheet.appendRow([new Date(), `Data parsed: Nama=${name}, Email=${email}, Nomor=${number}, Peserta=${participant}`]);
+
+    // 6. Format nomor WA (dengan validasi ketat)
+    var formattedNumber = formatNomorIndonesia(number);
+    if (!formattedNumber) {
+      throw new Error("Nomor WhatsApp tidak valid");
+    }
+
+    // 7. Validasi nomor WhatsApp
+    if (!isWhatsappNumberValid(formattedNumber, config)) {
+      var errorMsg = `*Pendaftaran Gagal* ❌\n\nNomor WA tidak valid atau tidak terdaftar.\nHubungi admin: ${config.admin_number}`;
+      sendWhatsappMessage(senderNumber, errorMsg, config);
+      logSheet.appendRow([new Date(), "Nomor tidak valid: " + formattedNumber]);
+      return createResponse("invalid_number", "Nomor tidak valid");
+    }
+
+    // 8. Proses data pendaftaran
+    var pendaftaranSheet = spreadsheet.getSheetByName("Pendaftaran") || spreadsheet.insertSheet("Pendaftaran");
+    var duplicateData = findDuplicateData(pendaftaranSheet, formattedNumber);
+
+    if (duplicateData) {
+      // Simpan data sementara untuk konfirmasi
+      saveTempData(senderNumber, { 
+        name: name, 
+        email: email, 
+        number: formattedNumber, 
+        participant: participant 
+      });
+      
+      // Kirim pesan konfirmasi update
+      var confirmMsg = buildDuplicateMessage(duplicateData, {name, email, participant});
+      sendWhatsappMessage(senderNumber, confirmMsg, config);
+      logSheet.appendRow([new Date(), "Menunggu konfirmasi update dari: " + senderNumber]);
+      return createResponse("waiting_confirmation", "Menunggu konfirmasi user");
+    } else {
+      // Simpan data baru
+      saveToSheet(pendaftaranSheet, name, email, formattedNumber, participant);
+      
+      // Kirim konfirmasi sukses
+      var successMsg = generateReplyMessage(name, email, formattedNumber, participant, config);
+      sendWhatsappMessage(formattedNumber, successMsg, config);
+      logSheet.appendRow([new Date(), "Data baru disimpan: " + formattedNumber]);
+      return createResponse("success", "Pendaftaran berhasil");
+    }
+
+  } catch (error) {
+    logSheet.appendRow([new Date(), "ERROR: " + error.message + "\nStack: " + error.stack]);
+    return createResponse("error", "Terjadi kesalahan: " + error.message);
+  }
+}
+
+/**
+ * ==============================================
+ * FUNGSI KONFIRMASI USER
+ * ==============================================
+ */
+
+/**
+ * Handle konfirmasi user (Ya/Tidak)
+ */
+function handleUserConfirmation(data, config) {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = spreadsheet.getSheetByName("Log");
+  var senderNumber = data.from;
+  var message = data.message.toLowerCase();
+  var tempData = getTempData(senderNumber);
+
+  if (!tempData) {
+    logSheet.appendRow([new Date(), "Tidak ada data temp untuk: " + senderNumber]);
+    return createResponse("error", "Sesi konfirmasi tidak valid");
+  }
+
+  var pendaftaranSheet = spreadsheet.getSheetByName("Pendaftaran");
+  var duplicateData = findDuplicateData(pendaftaranSheet, tempData.number);
+
+  if (message === "ya" && duplicateData) {
+    // Update data lama
+    pendaftaranSheet.getRange(duplicateData.row, 2, 1, 4).setValues([
+      [tempData.name, tempData.email, tempData.number, tempData.participant]
+    ]);
+    
+    // Kirim notifikasi update
+    var updateMsg = buildUpdateNotification(duplicateData, tempData);
+    sendWhatsappMessage(senderNumber, updateMsg, config);
+    logSheet.appendRow([new Date(), "Data diperbarui: " + tempData.number]);
+  } else {
+    sendWhatsappMessage(senderNumber, "❌ Pembaruan data dibatalkan", config);
+    logSheet.appendRow([new Date(), "Pembaruan dibatalkan oleh user"]);
+  }
+
+  clearTempData(senderNumber);
+  return createResponse("success", "Proses konfirmasi selesai");
+}
+
+/**
+ * ==============================================
+ * FUNGSI BANTU (HELPER FUNCTIONS)
+ * ==============================================
+ */
+
+/**
+ * Format nomor Indonesia dengan validasi ketat
+ */
+function formatNomorIndonesia(number) {
+  if (!number) {
+    Logger.log("Nomor tidak valid: " + JSON.stringify(number));
+    return "";
+  }
+  
+  try {
+    var clean = String(number).replace(/\D/g, '');
+    if (!clean) return "";
+    
+    if (clean.startsWith("0")) return "62" + clean.substring(1);
+    if (clean.startsWith("62")) return clean;
+    if (clean.startsWith("8")) return "62" + clean;
+    return clean;
+  } catch (e) {
+    Logger.log("Gagal memformat nomor: " + e.message);
+    return "";
+  }
+}
+
+/**
+ * Bangun pesan notifikasi duplikasi
+ */
+function buildDuplicateMessage(oldData, newData) {
+  return `*DATA DUPLIKAT DITEMUKAN* ⚠️\n\n` +
+    `Nomor WA ${oldData.number} sudah terdaftar:\n` +
+    `• Nama: ${oldData.name}\n` +
+    `• Email: ${oldData.email}\n` +
+    `• Nomor Peserta: ${oldData.participant}\n\n` +
+    `Balas *"Ya"* untuk memperbarui dengan:\n` +
+    `• Nama: ${newData.name}\n` +
+    `• Email: ${newData.email}\n` +
+    `• Nomor Peserta: ${newData.participant}\n\n` +
+    `Atau abaikan untuk membatalkan.`;
+}
+
+/**
+ * Bangun pesan notifikasi update
+ */
+function buildUpdateNotification(oldData, newData) {
+  return `*DATA BERHASIL DIPERBARUI* ✅\n\n` +
+    `Sebelum:\n` +
+    `• Nama: ${oldData.name}\n` +
+    `• Email: ${oldData.email}\n` +
+    `• Nomor Peserta: ${oldData.participant}\n\n` +
+    `Sesudah:\n` +
+    `• Nama: ${newData.name}\n` +
+    `• Email: ${newData.email}\n` +
+    `• Nomor Peserta: ${newData.participant}`;
+}
+
+/**
+ * Cari data duplikat berdasarkan nomor WA
+ */
+function findDuplicateData(sheet, number) {
+  if (!number || sheet.getLastRow() < 2) return null;
+  
+  var data = sheet.getRange(2, 1, sheet.getLastRow()-1, 5).getValues();
+  for (var i = 0; i < data.length; i++) {
+    var existingNumber = formatNomorIndonesia(data[i][3]);
+    if (existingNumber === number) {
+      return {
+        row: i + 2,
+        name: data[i][1],
+        email: data[i][2],
+        number: existingNumber,
+        participant: data[i][4]
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Simpan data ke sheet Pendaftaran
+ */
+function saveToSheet(sheet, name, email, number, participant) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(["Timestamp", "Nama", "Email", "Nomor WhatsApp", "Nomor Peserta"]);
+  }
+  sheet.appendRow([new Date(), name, email, number, participant]);
+}
+
+/**
+ * Penyimpanan sementara data konfirmasi
+ */
+function saveTempData(key, data) {
+  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(data));
+}
+
+function getTempData(key) {
+  var data = PropertiesService.getScriptProperties().getProperty(key);
+  return data ? JSON.parse(data) : null;
+}
+
+function clearTempData(key) {
+  PropertiesService.getScriptProperties().deleteProperty(key);
+}
+
+/**
+ * Buat sheet Konfigurasi jika belum ada
+ */
+function createConfigSheet() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Konfigurasi");
+  sheet.appendRow(["Parameter", "Nilai"]);
+  sheet.appendRow(["endpoint", "https://wasender.lutfifuadi.my.id/send-message"]);
+  sheet.appendRow(["endpoint_check_number", "https://wa.lutfifuadi.my.id/check-number"]);
+  sheet.appendRow(["api_key", "BOJYUUiMA1XWVaMcWWiPfCTs9SowiV"]);
+  sheet.appendRow(["sender", "6282191835987"]);
+  sheet.appendRow(["trigger_keyword", "daftar_moderasi_gratis"]);
+  sheet.appendRow(["admin_number", "081234567890"]);
+  sheet.appendRow(["nama_formulir", "Formulir Data EMIS MANSABA"]); // Add this line
+  sheet.getRange("A1:B1").setFontWeight("bold");
+  return sheet;
+}
+
+/**
+ * Ambil nilai konfigurasi dari sheet
+ */
+function getConfigValues(sheet) {
+  var data = sheet.getRange(2, 1, sheet.getLastRow()-1, 2).getValues();
+  var config = {};
+  data.forEach(row => {
+    config[row[0].toString().trim().toLowerCase()] = row[1].toString().trim();
+  });
+  return config;
+}
+
+/**
+ * Validasi konfigurasi wajib
+ */
+function validateConfig(config) {
+  var required = ["endpoint", "endpoint_check_number", "api_key", "sender", "trigger_keyword"];
+  required.forEach(key => {
+    if (!config[key]) throw new Error(`Konfigurasi '${key}' tidak ditemukan.`);
+  });
+  // Note: nama_formulir is optional, will fall back to default if not provided
+}
+
+/**
+ * Cek apakah pesan mengandung keyword trigger
+ */
+function isTriggerMatch(message, keyword) {
+  return message.toLowerCase().includes(keyword.toLowerCase());
+}
+
+/**
+ * Parsing data pendaftaran dari pesan
+ */
+function parseRegistrationData(message) {
+  return {
+    name: extractData(message, /nama:\s*(.*?)(?=email:|$)/i, true) || "",
+    email: extractData(message, /email:\s*(.*?)(?=nomor:|$)/i, false) || "",
+    number: extractData(message, /nomor:\s*(.*?)(?=nomor peserta:|$)/i, false) || "",
+    participant: extractData(message, /nomor peserta:\s*(.*?)$/i, true) || ""
+  };
+}
+
+/**
+ * Ekstrak data dari teks menggunakan regex
+ */
+function extractData(text, regex, toUpper) {
+  var match = text.match(regex);
+  if (!match) return "";
+  var value = match[1].trim();
+  return toUpper ? value.toUpperCase() : value.toLowerCase();
+}
+
+/**
+ * Generate pesan balasan
+ */
+function generateReplyMessage(name, email, number, participant, config) {
+  var namaPanggilan = name ? name.split(" ")[0] : "Bapak/Ibu";
+  var programName = config.nama_formulir || "Nama Formulir Disini"; // Fallback to default if not configured
+  return `*Yth. ${namaPanggilan}*,\n\n` +
+    `Terima kasih telah mengisi *${programName}*. Berikut detail Anda:\n\n` +
+    "📋 *DATA PENDAFTARAN*\n" +
+    `  • Nama Lengkap: ${name || "-"}\n` +
+    `  • Email: ${email || "-"}\n` +
+    `  • Nomor WhatsApp: ${number || "-"}\n` +
+    `  • Nomor Peserta: ${participant || "Belum tercantum"}\n\n` +
+    "📅 *Proses Selanjutnya*\n" +
+    "Tim kami akan menghubungi Anda dalam 1x24 jam untuk konfirmasi.\n\n" +
+    "📌 *Hubungi Kami*\n" +
+    "Jika ada pertanyaan, silakan balas pesan ini atau hubungi:\n" +
+    `📞 ${config.admin_number} (Admin)\n\n` +
+    "*Hormat kami,*\n" +
+    `*Tim Layanan ${programName}*`;
+}
+
+/**
+ * Kirim pesan WhatsApp
+ */
+function sendWhatsappMessage(number, message, config) {
+  var payload = {
+    api_key: config.api_key,
+    sender: config.sender,
+    number: number,
+    message: message
+  };
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    var response = UrlFetchApp.fetch(config.endpoint, options);
+    return response.getContentText();
+  } catch (err) {
+    throw new Error("Gagal mengirim pesan WhatsApp: " + err.message);
+  }
+}
+
+/**
+ * Validasi nomor WhatsApp
+ */
+function isWhatsappNumberValid(number, config) {
+  var payload = {
+    api_key: config.api_key,
+    sender: config.sender,
+    number: number
+  };
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(config.endpoint_check_number, options);
+    var result = JSON.parse(response.getContentText());
+    return result.status === true;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Buat response JSON
+ */
+function createResponse(status, message) {
+  return ContentService.createTextOutput(
+    JSON.stringify({ status: status, message: message })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
