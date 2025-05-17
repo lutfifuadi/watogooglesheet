@@ -254,9 +254,9 @@ function clearTempData(key) {
 function createConfigSheet() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Konfigurasi");
   sheet.appendRow(["Parameter", "Nilai"]);
-  sheet.appendRow(["endpoint", "https://wasender.lutfifuadi.my.id/send-message"]);
+  sheet.appendRow(["endpoint", "https://wa.lutfifuadi.my.id/send-message"]);
   sheet.appendRow(["endpoint_check_number", "https://wa.lutfifuadi.my.id/check-number"]);
-  sheet.appendRow(["api_key", "BOJYUUiMA1XWVaMcWWiPfCTs9SowiV"]);
+  sheet.appendRow(["api_key", "API_KEY_ANDA);
   sheet.appendRow(["sender", "6282191835987"]);
   sheet.appendRow(["trigger_keyword", "daftar_moderasi_gratis"]);
   sheet.appendRow(["admin_number", "081234567890"]);
