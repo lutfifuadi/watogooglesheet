@@ -1,0 +1,743 @@
+/**
+ * ==============================================
+ * KODE UTAMA - WEBHOOK HANDLER
+ * ==============================================
+ */
+
+/**
+ * Fungsi utama untuk menangani request POST dari webhook
+ * @param {Object} e - Event object dari Google Apps Script
+ */
+function doPost(e) {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = spreadsheet.getSheetByName("Log") || spreadsheet.insertSheet("Log");
+  
+  // Log request masuk secara detail
+  logSheet.appendRow([new Date(), "Request masuk (raw): " + JSON.stringify(e)]);
+  
+  try {
+    // 1. Ambil konfigurasi
+    var configSheet = spreadsheet.getSheetByName("Konfigurasi") || createConfigSheet();
+    var config = getConfigValues(configSheet);
+    validateConfig(config);
+    
+    // 2. Ambil konfigurasi bot
+    var botSheet = spreadsheet.getSheetByName("Bot") || createBotSheet();
+    var botConfig = getBotConfigValues(botSheet);
+
+    // 3. Parse data input
+    var requestData = JSON.parse(e.postData.contents);
+    var message = requestData.message || "";
+    var senderNumber = requestData.from || "";
+    logSheet.appendRow([new Date(), "Data parsed: " + JSON.stringify({message: message, senderNumber: senderNumber})]);
+
+    // 4. Handle konfirmasi user (Ya/Tidak)
+    if (message.toLowerCase() === "ya" || message.toLowerCase() === "tidak") {
+      return handleUserConfirmation(requestData, config, botConfig);
+    }
+
+    // 5. Parsing data pendaftaran (dengan error handling)
+    var parsedData = parseRegistrationData(message);
+    var hasRegistrationData = parsedData.name && parsedData.number; // Minimal harus ada nama dan nomor
+    
+    if (hasRegistrationData) {
+      var name = parsedData.name || "";
+      var email = parsedData.email || "";
+      var number = parsedData.number || "";
+      var nik = parsedData.nik ? "'" + parsedData.nik : ""; // Tambahkan apostrof untuk memastikan disimpan sebagai teks
+      var nisn = parsedData.nisn ? "'" + parsedData.nisn : ""; // Tambahkan apostrof untuk memastikan disimpan sebagai teks
+      var asalSekolah = parsedData.asalSekolah || "";
+      var jenisKelamin = parsedData.jenisKelamin || "";
+      
+      // Validasi NIK (harus 16 digit angka)
+      if (nik && !/^\d{16}$/.test(parsedData.nik)) {
+        var errorMsg = botConfig.invalid_nik_message.replace("${admin_number}", config.admin_number);
+        sendWhatsappMessage(senderNumber, errorMsg, config);
+        logSheet.appendRow([new Date(), "NIK tidak valid: " + parsedData.nik]);
+        return createResponse("invalid_nik", "NIK tidak valid");
+      }
+  
+      // Validasi NISN (harus 10 digit angka)
+      if (nisn && !/^\d{10}$/.test(parsedData.nisn)) {
+        var errorMsg = botConfig.invalid_nisn_message.replace("${admin_number}", config.admin_number);
+        sendWhatsappMessage(senderNumber, errorMsg, config);
+        logSheet.appendRow([new Date(), "NISN tidak valid: " + parsedData.nisn]);
+        return createResponse("invalid_nisn", "NISN tidak valid");
+      }
+
+      // Log hasil parsing
+      logSheet.appendRow([new Date(), `Data parsed: Nama=${name}, Email=${email}, Nomor=${number}, Jenis Kelamin=${jenisKelamin}, NIK=${nik}, NISN=${nisn}, Asal Sekolah=${asalSekolah}`]);
+
+      // 6. Format nomor WA (dengan validasi ketat)
+      var formattedNumber = formatNomorIndonesia(number);
+      if (!formattedNumber) {
+        throw new Error("Nomor WhatsApp tidak valid");
+      }
+
+      // 7. Validasi nomor WhatsApp
+      if (!isWhatsappNumberValid(formattedNumber, config)) {
+        var errorMsg = botConfig.invalid_number_message
+          .replace("${formattedNumber}", formattedNumber)
+          .replace("${admin_number}", config.admin_number);
+        
+        sendWhatsappMessage(senderNumber, errorMsg, config);
+        logSheet.appendRow([new Date(), "Nomor tidak valid: " + formattedNumber]);
+        return createResponse("invalid_number", "Nomor tidak valid");
+      }
+
+      // 8. Jika nomor valid, lanjutkan proses pendaftaran
+      var pendaftaranSheet = spreadsheet.getSheetByName("Pendaftaran") || createPendaftaranSheet();
+      var duplicateData = findDuplicateData(pendaftaranSheet, formattedNumber, nik);
+
+      // Cek duplikasi NIK
+      if (duplicateData && duplicateData.type === 'nik') {
+        var errorMsg = botConfig.duplicate_nik_message
+          .replace("${nik}", nik.replace(/^'/, ''))
+          .replace("${name}", duplicateData.name)
+          .replace("${number}", duplicateData.number)
+          .replace("${admin_number}", config.admin_number);
+        
+        sendWhatsappMessage(senderNumber, errorMsg, config);
+        logSheet.appendRow([new Date(), "NIK sudah terdaftar: " + nik]);
+        return createResponse("duplicate_nik", "NIK sudah terdaftar");
+      }
+
+      // Cek duplikasi nomor WA
+      if (duplicateData && duplicateData.type === 'number') {
+        // Simpan data sementara untuk konfirmasi
+        saveTempData(senderNumber, { 
+          name: name, 
+          email: email, 
+          number: formattedNumber,
+          jenisKelamin: jenisKelamin,
+          nik: nik,
+          nisn: nisn,
+          asalSekolah: asalSekolah
+        });
+        
+        // Kirim pesan konfirmasi update
+        var confirmMsg = buildDuplicateMessage(duplicateData, {name, email, jenisKelamin, nik, nisn, asalSekolah}, botConfig);
+        sendWhatsappMessage(senderNumber, confirmMsg, config);
+        logSheet.appendRow([new Date(), "Menunggu konfirmasi update dari: " + senderNumber]);
+        return createResponse("waiting_confirmation", "Menunggu konfirmasi user");
+      } else {
+        // Simpan data baru
+        var generatedParticipant = saveToSheet(pendaftaranSheet, name, email, formattedNumber, jenisKelamin, nik, nisn, asalSekolah, config);
+        
+        // Kirim konfirmasi sukses
+        var successMsg = generateReplyMessage(name, email, formattedNumber, jenisKelamin, generatedParticipant, nik, nisn, asalSekolah, config, botConfig);
+        sendWhatsappMessage(formattedNumber, successMsg, config);
+        logSheet.appendRow([new Date(), "Data baru disimpan: " + formattedNumber]);
+        return createResponse("success", "Pendaftaran berhasil");
+      }
+    }
+    // 9. Jika bukan data pendaftaran, cek trigger keyword
+    else if (isTriggerMatch(message, botConfig.trigger_keyword)) {
+      // Kirim respon otomatis jika trigger keyword terdeteksi
+      if (botConfig.trigger_response) {
+        sendWhatsappMessage(senderNumber, botConfig.trigger_response, config);
+        logSheet.appendRow([new Date(), "Trigger keyword terdeteksi, mengirim petunjuk pendaftaran"]);
+        return createResponse("trigger_detected", "Pesan petunjuk pendaftaran dikirim");
+      }
+    } else {
+      logSheet.appendRow([new Date(), "Pesan diabaikan: Bukan data pendaftaran atau trigger"]);
+      return createResponse("ignored", "Pesan tidak dikenali");
+    }
+
+  } catch (error) {
+    logSheet.appendRow([new Date(), "ERROR: " + error.message + "\nStack: " + error.stack]);
+    return createResponse("error", "Terjadi kesalahan: " + error.message);
+  }
+}
+
+/**
+ * ==============================================
+ * FUNGSI INISIALISASI SHEET
+ * ==============================================
+ */
+
+/**
+ * Buat sheet Konfigurasi jika belum ada
+ */
+function createConfigSheet() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("Konfigurasi");
+  sheet.appendRow(["Parameter", "Nilai"]);
+  sheet.appendRow(["endpoint", "https://wa.lutfifuadi.my.id/send-message"]);
+  sheet.appendRow(["endpoint_check_number", "https://wa.lutfifuadi.my.id/check-number"]);
+  sheet.appendRow(["api_key", "p6zOnBx6SEBm7mHI0PCTpEmuVZVTNS"]);
+  sheet.appendRow(["sender", "628886225673"]);
+  sheet.appendRow(["admin_number", "081234567890"]);
+  sheet.appendRow(["nama_formulir", "Formulir PPDB MANSABA"]);
+  sheet.appendRow(["format_pendaftaran", "MANSABA-${nomor}"]);
+  sheet.getRange("A1:B1").setFontWeight("bold");
+  return sheet;
+}
+
+/**
+ * Buat sheet Bot jika belum ada atau update dengan parameter baru
+ */
+function createBotSheet() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = spreadsheet.getSheetByName("Bot") || spreadsheet.insertSheet("Bot");
+  
+  // Clear existing data if any
+  sheet.clear();
+  
+  // Get nama_formulir from Konfigurasi sheet if it exists
+  var namaFormulir = "PPDB MAN 1 Kota Bandung"; // default value
+  try {
+    var configSheet = spreadsheet.getSheetByName("Konfigurasi");
+    if (configSheet) {
+      var config = getConfigValues(configSheet);
+      if (config.nama_formulir) {
+        namaFormulir = config.nama_formulir;
+      }
+    }
+  } catch (e) {
+    Logger.log("Error getting nama_formulir: " + e.message);
+  }
+  
+  // Create headers
+  sheet.appendRow(["Parameter", "Nilai"]);
+  
+  // Add all parameters
+  sheet.appendRow(["trigger_keyword", "98"]);
+  sheet.appendRow(["trigger_response", 
+    "*TERIMA KASIH TELAH MENDAFTAR* 🙏\n\n" +
+    "Kami telah menerima pendaftaran Anda untuk *" + namaFormulir + "*.\n\n" +
+    "Silakan lengkapi data diri Anda dengan format berikut:\n\n" +
+    "Nama: [Nama Lengkap]\n" +
+    "Jenis Kelamin: [L/P]\n" +
+    "Email: [Alamat Email]\n" +
+    "Nomor WA: [Nomor WhatsApp]\n" +
+    "NIK: [Nomor Induk Kependudukan - 16 digit]\n" +
+    "NISN: [Nomor Induk Siswa Nasional - 10 digit]\n" +
+    "Asal Sekolah: [Nama Sekolah Asal]\n\n" +
+    "Contoh:\n" +
+    "Nama: Ahmad Budiman\n" +
+    "Jenis Kelamin: L\n" +
+    "Email: ahmad@gmail.com\n" +
+    "Nomor WA: 6281234567890\n" +
+    "NIK: 1234567890123456\n" +
+    "NISN: 1234567890\n" +
+    "Asal Sekolah: SMP Negeri 1 Bandung"]);
+  
+  sheet.appendRow(["invalid_number_message", 
+    "*PENDAFTARAN TIDAK DAPAT DIPROSES* ❌\n\n" +
+    "Nomor WhatsApp *${formattedNumber}* tidak terdaftar di WhatsApp atau formatnya tidak valid.\n\n" +
+    "*Beberapa kemungkinan penyebab:*\n" +
+    "• Nomor belum terdaftar di WhatsApp\n" +
+    "• Format nomor tidak sesuai (contoh format benar: 6281234567890)\n" +
+    "• Nomor WhatsApp sedang non-aktif\n\n" +
+    "*Solusi:*\n" +
+    "1. Pastikan nomor WhatsApp aktif dan terdaftar\n" +
+    "2. Gunakan format nomor dengan kode negara (62) tanpa tanda + atau spasi\n" +
+    "3. Contoh penulisan: *62812xxxxxxx*\n" +
+    "4. Jika masalah berlanjut, hubungi Admin:\n" +
+    "📞 ${admin_number}\n\n" +
+    "Kami tunggu pendaftaran ulang Anda dengan nomor yang valid."]);
+  
+  // Tambahkan pesan validasi NIK yang elegan
+  sheet.appendRow(["invalid_nik_message",
+    "*DATA NIK TIDAK VALID* ❌\n\n" +
+    "Nomor Induk Kependudukan (NIK) yang Anda masukkan *tidak memenuhi syarat*.\n\n" +
+    "*Syarat NIK yang valid:*\n" +
+    "• Harus terdiri dari *16 digit angka*\n" +
+    "• Tidak boleh mengandung huruf atau karakter khusus\n" +
+    "• Contoh NIK yang valid: *1234567890123456*\n\n" +
+    "*Silakan periksa kembali dan kirim ulang data Anda dengan format:*\n" +
+    "NIK: [16 digit angka NIK Anda]\n\n" +
+    "Jika Anda yakin NIK sudah benar tetapi tetap error, mohon hubungi Admin:\n" +
+    "📞 ${admin_number}"]);
+  
+  // Tambahkan pesan validasi NISN yang elegan
+  sheet.appendRow(["invalid_nisn_message",
+    "*DATA NISN TIDAK VALID* ❌\n\n" +
+    "Nomor Induk Siswa Nasional (NISN) yang Anda masukkan *tidak memenuhi syarat*.\n\n" +
+    "*Syarat NISN yang valid:*\n" +
+    "• Harus terdiri dari *10 digit angka*\n" +
+    "• Tidak boleh mengandung huruf atau karakter khusus\n" +
+    "• Contoh NISN yang valid: *1234567890*\n\n" +
+    "*Silakan periksa kembali dan kirim ulang data Anda dengan format:*\n" +
+    "NISN: [10 digit angka NISN Anda]\n\n" +
+    "Jika Anda yakin NISN sudah benar tetapi tetap error, mohon hubungi Admin:\n" +
+    "📞 ${admin_number}"]);
+  
+  sheet.appendRow(["duplicate_message_header", "*DATA DUPLIKAT DITEMUKAN* ⚠️"]);
+  
+  // Tambahkan pesan untuk NIK duplikat
+  sheet.appendRow(["duplicate_nik_message_header", "*DATA NIK DUPLIKAT DITEMUKAN* ⚠️"]);
+  sheet.appendRow(["duplicate_nik_message", 
+    "*NIK SUDAH TERDAFTAR* ❌\n\n" +
+    "Nomor Induk Kependudukan (NIK) *${nik}* sudah terdaftar atas nama:\n" +
+    "• Nama: ${name}\n" +
+    "• Nomor WA: ${number}\n\n" +
+    "Jika ini adalah data Anda, silakan gunakan nomor WA yang sama untuk pendaftaran.\n" +
+    "Jika merasa ini kesalahan, mohon hubungi Admin:\n" +
+    "📞 ${admin_number}\n\n" +
+    "*Pendaftaran tidak dapat dilanjutkan dengan NIK yang sama.*"]);
+  
+  sheet.appendRow(["update_notification_header", "*DATA BERHASIL DIPERBARUI* ✅"]);
+  sheet.appendRow(["success_message_header", "*Yth. ${namaPanggilan}*,"]);
+  sheet.appendRow(["cancel_message", "❌ Pembaruan data dibatalkan"]);
+  sheet.appendRow(["registration_details_label", "📋 *DATA PENDAFTARAN*"]);
+  sheet.appendRow(["next_steps_label", "📅 *Proses Selanjutnya*"]);
+  sheet.appendRow(["contact_us_label", "📌 *Hubungi Kami*"]);
+  
+  // Tambahkan template pesan sukses pendaftaran
+  sheet.appendRow(["success_registration_message",
+    "*Yth. ${namaPanggilan}*,\n\n" +
+    "Terima kasih telah mendaftar di *${programName}*. Berikut detail pendaftaran Anda:\n\n" +
+    "📋 *DATA PENDAFTARAN*\n" +
+    "  • Nama Lengkap: ${name}\n" +
+    "  • Jenis Kelamin: ${jenisKelamin}\n" +
+    "  • Email: ${email}\n" +
+    "  • Nomor WhatsApp: ${number}\n" +
+    "  • NIK: ${nik}\n" +
+    "  • NISN: ${nisn}\n" +
+    "  • Asal Sekolah: ${asalSekolah}\n" +
+    "  • Nomor Peserta: *${participant}*\n\n" +
+    "📅 *Proses Selanjutnya*\n" +
+    "1. Simpan baik-baik nomor peserta Anda\n" +
+    "2. Nomor peserta ini akan digunakan untuk seluruh proses seleksi\n" +
+    "3. Tim kami akan menghubungi Anda dalam 1x24 jam\n\n" +
+    "📌 *Hubungi Kami*\n" +
+    "Jika ada pertanyaan atau data belum sesuai:\n" +
+    "📞 ${admin_number} (Admin)\n\n" +
+    "*Hormat kami,*\n" +
+    "*Panitia ${programName}*"]);
+  
+  // Tambahkan template footer yang konsisten
+  sheet.appendRow(["footer_template",
+    "\n\n*Hormat kami,*\n" +
+    "*Panitia ${programName}*\n" +
+    "📞 ${admin_number}\n" +
+    "🌐 www.mansaba.sch.id\n" +
+    "🏫 MAN 1 Kota Bandung\n" +
+    "Jl. Contoh No. 123, Bandung"]);
+  
+  // Format header
+  sheet.getRange("A1:B1").setFontWeight("bold");
+  return sheet;
+}
+
+/**
+ * Buat sheet Pendaftaran dengan struktur baru jika belum ada
+ */
+function createPendaftaranSheet() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = spreadsheet.insertSheet("Pendaftaran");
+  
+  // Buat header sesuai struktur baru
+  sheet.appendRow([
+    "TIMESTAMP", 
+    "NOMOR PENDAFTARAN", 
+    "NAMA LENGKAP", 
+    "NOMOR WHATSAPP", 
+    "JENIS KELAMIN",
+    "EMAIL", 
+    "NIK", 
+    "NISN", 
+    "ASAL SEKOLAH"
+  ]);
+  
+  // Format header
+  sheet.getRange("A1:I1").setFontWeight("bold");
+  
+  // Set format kolom NIK dan NISN sebagai teks
+  sheet.getRange("G2:G").setNumberFormat("@");
+  sheet.getRange("H2:H").setNumberFormat("@");
+  
+  return sheet;
+}
+
+/**
+ * ==============================================
+ * FUNGSI KONFIRMASI USER
+ * ==============================================
+ */
+
+/**
+ * Handle konfirmasi user (Ya/Tidak)
+ */
+function handleUserConfirmation(data, config, botConfig) {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = spreadsheet.getSheetByName("Log");
+  var senderNumber = data.from;
+  var message = data.message.toLowerCase();
+  var tempData = getTempData(senderNumber);
+
+  if (!tempData) {
+    logSheet.appendRow([new Date(), "Tidak ada data temp untuk: " + senderNumber]);
+    return createResponse("error", "Sesi konfirmasi tidak valid");
+  }
+
+  var pendaftaranSheet = spreadsheet.getSheetByName("Pendaftaran");
+  var duplicateData = findDuplicateData(pendaftaranSheet, tempData.number, tempData.nik);
+
+  if (message === "ya" && duplicateData) {
+    // Update data lama dengan struktur baru
+    pendaftaranSheet.getRange(duplicateData.row, 3, 1, 7).setValues([[ // 7 kolom karena TIMESTAMP dan NOMOR PENDAFTARAN tidak diupdate
+      tempData.name, // NAMA LENGKAP (kolom 3)
+      tempData.number, // NOMOR WHATSAPP (kolom 4)
+      tempData.jenisKelamin, // JENIS KELAMIN (kolom 5)
+      tempData.email, // EMAIL (kolom 6)
+      tempData.nik, // NIK (kolom 7) - disimpan sebagai teks
+      tempData.nisn, // NISN (kolom 8) - disimpan sebagai teks
+      tempData.asalSekolah // ASAL SEKOLAH (kolom 9)
+    ]]);
+    
+    // Kirim notifikasi update
+    var updateMsg = buildUpdateNotification(duplicateData, tempData, botConfig);
+    sendWhatsappMessage(senderNumber, updateMsg, config);
+    logSheet.appendRow([new Date(), "Data diperbarui: " + tempData.number]);
+  } else {
+    sendWhatsappMessage(senderNumber, botConfig.cancel_message, config);
+    logSheet.appendRow([new Date(), "Pembaruan dibatalkan oleh user"]);
+  }
+
+  clearTempData(senderNumber);
+  return createResponse("success", "Proses konfirmasi selesai");
+}
+
+/**
+ * ==============================================
+ * FUNGSI BANTU (HELPER FUNCTIONS)
+ * ==============================================
+ */
+
+/**
+ * Ambil nilai konfigurasi dari sheet
+ */
+function getConfigValues(sheet) {
+  var data = sheet.getRange(2, 1, sheet.getLastRow()-1, 2).getValues();
+  var config = {};
+  data.forEach(row => {
+    config[row[0].toString().trim().toLowerCase()] = row[1].toString().trim();
+  });
+  return config;
+}
+
+/**
+ * Ambil nilai konfigurasi bot dari sheet
+ */
+function getBotConfigValues(sheet) {
+  var data = sheet.getRange(2, 1, sheet.getLastRow()-1, 2).getValues();
+  var config = {};
+  data.forEach(row => {
+    config[row[0].toString().trim().toLowerCase()] = row[1].toString().trim();
+  });
+  return config;
+}
+
+/**
+ * Validasi konfigurasi wajib
+ */
+function validateConfig(config) {
+  var required = ["endpoint", "endpoint_check_number", "api_key", "sender"];
+  required.forEach(key => {
+    if (!config[key]) throw new Error(`Konfigurasi '${key}' tidak ditemukan.`);
+  });
+}
+
+/**
+ * Format nomor Indonesia dengan validasi ketat
+ */
+function formatNomorIndonesia(number) {
+  if (!number) {
+    Logger.log("Nomor tidak valid: " + JSON.stringify(number));
+    return "";
+  }
+  
+  try {
+    var clean = String(number).replace(/\D/g, '');
+    if (!clean) return "";
+    
+    if (clean.startsWith("0")) return "62" + clean.substring(1);
+    if (clean.startsWith("62")) return clean;
+    if (clean.startsWith("8")) return "62" + clean;
+    return clean;
+  } catch (e) {
+    Logger.log("Gagal memformat nomor: " + e.message);
+    return "";
+  }
+}
+
+/**
+ * Validasi nomor WhatsApp dengan endpoint_check_number
+ */
+function isWhatsappNumberValid(number, config) {
+  // Jika tidak ada endpoint untuk cek nomor, anggap nomor valid
+  if (!config.endpoint_check_number) {
+    return true;
+  }
+
+  var payload = {
+    api_key: config.api_key,
+    sender: config.sender,
+    number: number
+  };
+  
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(config.endpoint_check_number, options);
+    var result = JSON.parse(response.getContentText());
+    return result.status === true;
+  } catch (err) {
+    Logger.log("Error checking WhatsApp number: " + err.message);
+    return false;
+  }
+}
+
+/**
+ * Cek apakah pesan mengandung keyword trigger
+ */
+function isTriggerMatch(message, keyword) {
+  return message.toLowerCase().includes(keyword.toLowerCase());
+}
+
+/**
+ * Parsing data pendaftaran dari pesan
+ */
+function parseRegistrationData(message) {
+  return {
+    name: extractData(message, /nama:\s*(.*?)(?=jenis kelamin:|$)/i, true) || "",
+    jenisKelamin: extractData(message, /jenis kelamin:\s*(.*?)(?=email:|$)/i, true) || "",
+    email: extractData(message, /email:\s*(.*?)(?=nomor wa:|$)/i, false) || "",
+    number: extractData(message, /nomor wa:\s*(.*?)(?=nik:|$)/i, false) || "",
+    nik: extractData(message, /nik:\s*(.*?)(?=nisn:|$)/i, false) || "",
+    nisn: extractData(message, /nisn:\s*(.*?)(?=asal sekolah:|$)/i, false) || "",
+    asalSekolah: extractData(message, /asal sekolah:\s*(.*?)$/i, true) || ""
+  };
+}
+
+/**
+ * Ekstrak data dari teks menggunakan regex
+ */
+function extractData(text, regex, toUpper) {
+  var match = text.match(regex);
+  if (!match) return "";
+  var value = match[1].trim();
+  return toUpper ? value.toUpperCase() : value.toLowerCase();
+}
+
+/**
+ * Cari data duplikat berdasarkan nomor WA atau NIK
+ */
+function findDuplicateData(sheet, number, nik) {
+  if ((!number && !nik) || sheet.getLastRow() < 2) return null;
+  
+  var data = sheet.getRange(2, 1, sheet.getLastRow()-1, 9).getValues();
+  for (var i = 0; i < data.length; i++) {
+    var existingNumber = formatNomorIndonesia(data[i][3]);
+    var existingNik = data[i][6] ? data[i][6].toString().replace(/^'/, '') : '';
+    
+    // Cek duplikasi nomor WA
+    if (number && existingNumber === number) {
+      return {
+        type: 'number',
+        row: i + 2,
+        name: data[i][2],
+        jenisKelamin: data[i][4],
+        email: data[i][5],
+        number: existingNumber,
+        nik: existingNik,
+        nisn: data[i][7],
+        asalSekolah: data[i][8]
+      };
+    }
+    
+    // Cek duplikasi NIK (jika NIK diinput)
+    if (nik && existingNik === nik.replace(/^'/, '')) {
+      return {
+        type: 'nik',
+        row: i + 2,
+        name: data[i][2],
+        jenisKelamin: data[i][4],
+        email: data[i][5],
+        number: existingNumber,
+        nik: existingNik,
+        nisn: data[i][7],
+        asalSekolah: data[i][8]
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Simpan data ke sheet Pendaftaran dengan struktur baru
+ */
+function saveToSheet(sheet, name, email, number, jenisKelamin, nik, nisn, asalSekolah, config) {
+  // Buat header jika sheet kosong
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow([
+      "TIMESTAMP", 
+      "NOMOR PENDAFTARAN", 
+      "NAMA LENGKAP", 
+      "NOMOR WHATSAPP", 
+      "JENIS KELAMIN",
+      "EMAIL", 
+      "NIK", 
+      "NISN", 
+      "ASAL SEKOLAH"
+    ]);
+    
+    // Set format kolom NIK dan NISN sebagai teks
+    sheet.getRange("G2:G").setNumberFormat("@");
+    sheet.getRange("H2:H").setNumberFormat("@");
+  }
+  
+  // Hitung nomor urut (baris saat ini dikurangi 1 karena header)
+  var rowNumber = sheet.getLastRow() - 1;
+  
+  // Generate nomor peserta jika format tersedia
+  var generatedParticipant = "";
+  if (config && config.format_pendaftaran) {
+    generatedParticipant = config.format_pendaftaran.replace("${nomor}", rowNumber);
+  }
+  
+  // Simpan data dengan struktur baru
+  sheet.appendRow([
+    new Date(), 
+    generatedParticipant, 
+    name, 
+    number, 
+    jenisKelamin,
+    email, 
+    nik, 
+    nisn, 
+    asalSekolah
+  ]);
+  
+  return generatedParticipant;
+}
+
+/**
+ * Penyimpanan sementara data konfirmasi
+ */
+function saveTempData(key, data) {
+  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(data));
+}
+
+function getTempData(key) {
+  var data = PropertiesService.getScriptProperties().getProperty(key);
+  return data ? JSON.parse(data) : null;
+}
+
+function clearTempData(key) {
+  PropertiesService.getScriptProperties().deleteProperty(key);
+}
+
+/**
+ * Bangun pesan notifikasi duplikasi
+ */
+function buildDuplicateMessage(oldData, newData, botConfig) {
+  return botConfig.duplicate_message_header + "\n\n" +
+    `Nomor WA ${oldData.number} sudah terdaftar:\n` +
+    `• Nama: ${oldData.name}\n` +
+    `• Jenis Kelamin: ${oldData.jenisKelamin || "-"}\n` +
+    `• Email: ${oldData.email}\n` +
+    `• NIK: ${oldData.nik || "-"}\n` +
+    `• NISN: ${oldData.nisn || "-"}\n` +
+    `• Asal Sekolah: ${oldData.asalSekolah || "-"}\n\n` +
+    `Balas *"Ya"* untuk memperbarui dengan:\n` +
+    `• Nama: ${newData.name}\n` +
+    `• Jenis Kelamin: ${newData.jenisKelamin || "-"}\n` +
+    `• Email: ${newData.email}\n` +
+    `• NIK: ${newData.nik || "-"}\n` +
+    `• NISN: ${newData.nisn || "-"}\n` +
+    `• Asal Sekolah: ${newData.asalSekolah || "-"}\n\n` +
+    `Atau abaikan untuk membatalkan.`;
+}
+
+/**
+ * Bangun pesan notifikasi update
+ */
+function buildUpdateNotification(oldData, newData, botConfig) {
+  return botConfig.update_notification_header + "\n\n" +
+    `Sebelum:\n` +
+    `• Nama: ${oldData.name}\n` +
+    `• Jenis Kelamin: ${oldData.jenisKelamin || "-"}\n` +
+    `• Email: ${oldData.email}\n` +
+    `• NIK: ${oldData.nik || "-"}\n` +
+    `• NISN: ${oldData.nisn || "-"}\n` +
+    `• Asal Sekolah: ${oldData.asalSekolah || "-"}\n\n` +
+    `Sesudah:\n` +
+    `• Nama: ${newData.name}\n` +
+    `• Jenis Kelamin: ${newData.jenisKelamin || "-"}\n` +
+    `• Email: ${newData.email}\n` +
+    `• NIK: ${newData.nik || "-"}\n` +
+    `• NISN: ${newData.nisn || "-"}\n` +
+    `• Asal Sekolah: ${newData.asalSekolah || "-"}`;
+}
+
+/**
+ * Generate pesan balasan dengan data baru
+ */
+function generateReplyMessage(name, email, number, jenisKelamin, participant, nik, nisn, asalSekolah, config, botConfig) {
+  var namaPanggilan = name ? name.split(" ")[0] : "Bapak/Ibu";
+  var programName = config.nama_formulir || "Nama Formulir Disini";
+  
+  // Hilangkan apostrof dari NIK dan NISN untuk ditampilkan di pesan
+  var displayNik = nik ? nik.replace(/^'/, '') : '-';
+  var displayNisn = nisn ? nisn.replace(/^'/, '') : '-';
+  
+  // Format jenis kelamin untuk tampilan
+  var displayJenisKelamin = jenisKelamin || '-';
+  if (displayJenisKelamin.toUpperCase() === 'L') displayJenisKelamin = 'Laki-laki';
+  if (displayJenisKelamin.toUpperCase() === 'P') displayJenisKelamin = 'Perempuan';
+  
+  return botConfig.success_registration_message
+    .replace("${namaPanggilan}", namaPanggilan)
+    .replace("${programName}", programName)
+    .replace("${name}", name || "-")
+    .replace("${jenisKelamin}", displayJenisKelamin)
+    .replace("${email}", email || "-")
+    .replace("${number}", number || "-")
+    .replace("${nik}", displayNik)
+    .replace("${nisn}", displayNisn)
+    .replace("${asalSekolah}", asalSekolah || "-")
+    .replace("${participant}", participant || "Belum tercantum")
+    .replace("${admin_number}", config.admin_number);
+}
+
+/**
+ * Kirim pesan WhatsApp
+ */
+function sendWhatsappMessage(number, message, config) {
+  var payload = {
+    api_key: config.api_key,
+    sender: config.sender,
+    number: number,
+    message: message
+  };
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    var response = UrlFetchApp.fetch(config.endpoint, options);
+    return response.getContentText();
+  } catch (err) {
+    throw new Error("Gagal mengirim pesan WhatsApp: " + err.message);
+  }
+}
+
+/**
+ * Buat response JSON
+ */
+function createResponse(status, message) {
+  return ContentService.createTextOutput(
+    JSON.stringify({ status: status, message: message })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
